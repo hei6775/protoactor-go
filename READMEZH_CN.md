@@ -139,3 +139,250 @@ func main() {
     console.ReadLine()
 }
 ```
+
+## State machines / SetBehavior, PushBehavior and PopBehavior
+
+```go
+type Hello struct{ Who string }
+type SetBehaviorActor struct{}
+
+func (state *SetBehaviorActor) Receive(context actor.Context) {
+    switch msg := context.Message().(type) {
+    case Hello:
+        fmt.Printf("Hello %v\n", msg.Who)
+        context.SetBehavior(state.Other)
+    }
+}
+
+func (state *SetBehaviorActor) Other(context actor.Context) {
+    switch msg := context.Message().(type) {
+    case Hello:
+        fmt.Printf("%v, ey we are now handling messages in another behavior", msg.Who)
+    }
+}
+
+func NewSetBehaviorActor() actor.Actor {
+    return &SetBehaviorActor{}
+}
+
+func main() {
+    context := actor.EmptyRootContext
+    props := actor.PropsFromProducer(NewSetBehaviorActor)
+    pid, err := context.Spawn(props)
+    if err != nil {
+        panic(err)
+    }
+    pid.Tell(Hello{Who: "Roger"})
+    pid.Tell(Hello{Who: "Roger"})
+    console.ReadLine()
+}
+```
+
+## Lifecycle events
+
+Unlike Akka, Proto Actor uses messages for lifecycle events instead of OOP method overrides
+
+```go
+type Hello struct{ Who string }
+type HelloActor struct{}
+
+func (state *HelloActor) Receive(context actor.Context) {
+    switch msg := context.Message().(type) {
+    case *actor.Started:
+        fmt.Println("Started, initialize actor here")
+    case *actor.Stopping:
+        fmt.Println("Stopping, actor is about shut down")
+    case *actor.Stopped:
+        fmt.Println("Stopped, actor and its children are stopped")
+    case *actor.Restarting:
+        fmt.Println("Restarting, actor is about restart")
+    case Hello:
+        fmt.Printf("Hello %v\n", msg.Who)
+    }
+}
+
+func main() {
+    context := actor.EmptyRootContext
+    props := actor.PropsFromProducer(func() actor.Actor { return &HelloActor{} })
+    pid, err := context.Spawn(props)
+    if err != nil {
+        panic(err)
+    }
+    actor.Tell(pid, Hello{Who: "Roger"})
+
+    // why wait?
+    // Stop is a system message and is not processed through the user message mailbox
+    // thus, it will be handled _before_ any user message
+    // we only do this to show the correct order of events in the console
+    time.Sleep(1 * time.Second)
+    pid.Stop()
+
+    console.ReadLine()
+}
+```
+
+## Supervision
+
+根节点actors由`actor.DefaultSupervisionStrategy()`监督，它始终为失败的actors发布一个`actor.RestartDirective`。
+子节点actors由他们的parents监督。
+parents可以使用`Proto Actor.Props`定制他们的子节点主管策略
+Root actors are supervised by the `actor.DefaultSupervisionStrategy()`, which always issues a `actor.RestartDirective` for failing actors
+Child actors are supervised by their parents.
+Parents can customize their child supervisor strategy using `Proto Actor.Props`
+
+### Example
+
+```go
+type Hello struct{ Who string }
+type ParentActor struct{}
+
+func (state *ParentActor) Receive(context actor.Context) {
+    switch msg := context.Message().(type) {
+    case Hello:
+        props := actor.PropsFromProducer(NewChildActor)
+        child := context.Spawn(props)
+        child.Tell(msg)
+    }
+}
+
+func NewParentActor() actor.Actor {
+    return &ParentActor{}
+}
+
+type ChildActor struct{}
+
+func (state *ChildActor) Receive(context actor.Context) {
+    switch msg := context.Message().(type) {
+    case *actor.Started:
+        fmt.Println("Starting, initialize actor here")
+    case *actor.Stopping:
+        fmt.Println("Stopping, actor is about shut down")
+    case *actor.Stopped:
+        fmt.Println("Stopped, actor and its children are stopped")
+    case *actor.Restarting:
+        fmt.Println("Restarting, actor is about restart")
+    case Hello:
+        fmt.Printf("Hello %v\n", msg.Who)
+        panic("Ouch")
+    }
+}
+
+func NewChildActor() actor.Actor {
+    return &ChildActor{}
+}
+
+func main() {
+    decider := func(reason interface{}) actor.Directive {
+        fmt.Println("handling failure for child")
+        return actor.StopDirective
+    }
+    supervisor := actor.NewOneForOneStrategy(10, 1000, decider)
+
+    context := actor.EmptyRootContext
+    props := actor.
+        FromProducer(NewParentActor).
+        WithSupervisor(supervisor)
+
+    pid, err := context.Spawn(props)
+    if err != nil {
+        panic(err)
+    }
+    context.Send(pid, Hello{Who: "Roger"})
+
+    console.ReadLine()
+}
+```
+
+## Networking / Remoting
+Proto Actor的网络层建立在gRPC的浅封装上，使用Protocol Buffers来进行消息的序列化
+
+
+### Example
+
+#### Node 1
+
+```go
+type MyActor struct {
+    count int
+}
+
+func (state *MyActor) Receive(context actor.Context) {
+    switch context.Message().(type) {
+    case *messages.Response:
+        state.count++
+        fmt.Println(state.count)
+    }
+}
+
+func main() {
+    remote.Start("localhost:8090")
+
+    rootCtx := actor.EmptyRootContext
+    props := actor.PropsFromProducer(func() actor.Actor { return &MyActor{} })
+    pid, _ := rootCtx.Spawn(props)
+    message := &messages.Echo{Message: "hej", Sender: pid}
+
+    // this is to spawn remote actor we want to communicate with
+    spawnResponse, _ := remote.SpawnNamed("localhost:8091", "myactor", "hello", time.Second)
+
+    // get spawned PID
+    spawnedPID := spawnResponse.Pid
+    for i := 0; i < 10; i++ {
+        rootCtx.Send(spawnedPID, message)
+    }
+
+    console.ReadLine()
+}
+```
+
+#### Node 2
+
+```go
+type MyActor struct{}
+
+func (*MyActor) Receive(context actor.Context) {
+    switch msg := context.Message().(type) {
+    case *messages.Echo:
+        context.Send(msg.Sender, &messages.Response{
+            SomeValue: "result",
+        })
+    }
+}
+
+func main() {
+    remote.Start("localhost:8091")
+
+    // register a name for our local actor so that it can be spawned remotely
+    remote.Register("hello", actor.PropsFromProducer(func() actor.Actor { return &MyActor{} }))
+    console.ReadLine()
+}
+```
+
+### Message Contracts
+
+```proto
+syntax = "proto3";
+package messages;
+import "actor.proto"; // we need to import actor.proto, so our messages can include PID's
+
+// this is the message the actor on node 1 will send to the remote actor on node 2
+message Echo {
+  actor.PID Sender = 1; // this is the PID the remote actor should reply to
+  string Message = 2;
+}
+
+// this is the message the remote actor should reply with
+message Response {
+  string SomeValue = 1;
+}
+```
+
+注意：在生成proto的代码时，请始终使用“gogoslick_out”而不是使用“go_out”，这是因为“gogoslick_out”将创建将在序列化期间使用的类型名称。
+Notice: always use "gogoslick_out" instead of "go_out" when generating proto code. "gogoslick_out" will create type names which will be used during serialization.
+
+For more examples, see the example folder in this repository.
+
+### Support
+
+Many thanks to [JetBrains](https://www.jetbrains.com) for support!
+
